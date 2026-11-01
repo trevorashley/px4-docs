@@ -7,5 +7,9 @@ Start with [flight modes](concepts/flight_modes.md) to understand how PX4
 interprets commands and controls multicopters, fixed-wing aircraft, and vertical
 takeoff and landing (VTOL) aircraft.
 
+The [skid-to-turn quad tailsitter](airframes/skid_to_turn_quad_tailsitter.md)
+chapter describes a proposed motor-only vehicle and the changes needed to
+control its velocity vector during forward flight.
+
 The notes follow PX4's development branch, `main`. Each chapter identifies the
 revision used to verify its explanations and links to that revision of the source.
