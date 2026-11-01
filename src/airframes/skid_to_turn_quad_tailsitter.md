@@ -6,7 +6,8 @@ vector using skid-to-turn maneuvers. This requires changes to both the mapping
 from desired motion to attitude and thrust and the rotational control law.
 PX4's current fixed-wing path commands banked turns, removes yaw attitude error,
 and adds coordinated-turn rate commands. The proposed geometric controller
-would replace the combined cruise attitude-and-rate control law.
+would provide combined attitude-and-rate control throughout hover, transition,
+and cruise, with reference generation appropriate to each phase.
 
 The design builds on PX4's existing motor-only quad tailsitter. The vehicle
 description and control objectives below record the intended behavior. The new
@@ -68,19 +69,24 @@ fixed-wing torque commands to the motor allocation path. This supports
 motor-only actuation, while the controllers upstream determine the maneuver
 those motors execute.
 
-The initial plan retains the existing VTOL tailsitter classification and adds
-an alternative cruise-control path. PX4 can continue reporting rotary-wing
-flight during hover and fixed-wing flight during cruise, following
+The proposed design retains the existing VTOL tailsitter classification and
+uses a shared rotational controller with a new cruise motion-control path.
+PX4 can continue reporting rotary-wing flight during hover and fixed-wing
+flight during cruise, following
 [`Commander::vtolStatusUpdate()`][vtol-status-update]. That classification
-identifies the active flight configuration, while the proposed controller
-changes how the vehicle is controlled within cruise. See
+identifies the active flight configuration, while the proposed architecture
+changes the controllers used in each configuration. See
 [flight modes](../concepts/flight_modes.md) for the distinction between a flight
 mode and the VTOL transition state.
+
+The [VTOL flight and transitions](../concepts/vtol_flight_and_transitions.md)
+chapter explains the stock subsystem handoffs and tailsitter transition rules
+that this design must account for.
 
 ### Reusing the Gazebo dynamics
 
 A separate airframe preset can use the existing Gazebo `quadtailsitter` model
-while selecting different cruise controllers. The preset configures PX4, and
+while selecting the new controller path. The preset configures PX4, and
 the [Gazebo model definition][quad-gazebo-model] supplies the simulated mass,
 inertia, motor response, and aerodynamic coefficients. Reusing that model
 allows the stock and proposed controllers to be compared on the same simulated
@@ -162,7 +168,8 @@ The proposed control sequence is:
 3. Use rotational control to track the complete attitude target, including yaw,
    and its angular motion to determine the required control moment.
 4. Convert the control moment and collective thrust into allocation inputs and
-   distribute them to the four motors through the VTOL motor-control path.
+   distribute them to the four motors through the actuator interface and motor
+   allocator.
 
 Rotational control can use separate attitude and rate loops or a combined law.
 The [geometric adaptive candidate](#candidate-geometric-adaptive-controller)
@@ -276,11 +283,11 @@ controller must therefore generate a smooth attitude reference with consistent
 derivatives. Abrupt attitude targets alone do not supply the reference motion
 used by the law.
 
-Adopting this law would replace the combined cruise attitude-and-rate control
-law. Passing its moment output through an unchanged PX4 rate controller would
-introduce another feedback loop and produce a different controller. The
-implementation must assign ownership of the rotational command at the point
-where the existing rate controller produces torque setpoints.
+Adopting this law would replace the combined attitude-and-rate control law
+in each supported phase. Passing its moment output through an unchanged PX4
+rate controller would introduce another feedback loop and produce a different
+controller. The implementation must assign ownership of the rotational command
+at the point where the existing rate controller produces torque setpoints.
 
 In PX4, this means replacing the cruise control law provided by both
 `fw_att_control` and `fw_rate_control`. The
@@ -328,96 +335,214 @@ outer velocity controller still requires development and analysis. Changing
 the position-tracking objective or removing position feedback would also
 change the assumptions of the paper's translational stability analysis.
 
-### PX4 integration and evaluation
+### Moment output and PX4 interfaces
 
 The paper's moment command has physical units, such as N m when the model uses
 SI units. PX4's [`VehicleTorqueSetpoint.xyz`][torque-setpoint] is normalized.
 Integration therefore requires an explicit conversion consistent with the
-actuator model, allocator normalization, and tailsitter frame transformations.
+actuator model and allocator normalization. References supplied in a legacy
+virtual fixed-wing frame also require the appropriate tailsitter transform.
 The [tailsitter allocation configuration][tailsitter-normalization] enables
 roll, pitch, and yaw normalization for the motor allocation matrix.
 
 In VTOL operation, the [existing fixed-wing rate controller][fw-rate-outputs]
 publishes `vehicle_torque_setpoint_virtual_fw` and
-`vehicle_thrust_setpoint_virtual_fw`. A replacement must integrate with the
-phase-dependent VTOL routing and its differential-thrust scaling, with a defined
-publisher for each command. The controller must also account for motor limits
-and specify how adaptation behaves during saturation, disarming, and handover.
-Those implementation choices require evaluation beyond the paper's control law.
+`vehicle_thrust_setpoint_virtual_fw`. The proposed
+[shared architecture](#shared-rotational-control-architecture) changes that
+routing to provide one actuator command stream across flight phases. The
+controller must also account for motor limits and specify how adaptation
+behaves during saturation, disarming, and changes in reference source. Those
+implementation choices require evaluation beyond the paper's control law.
 
-The proposed evaluation starts with the geometric controller's feedback and
-reference-motion terms while adaptive compensation is disabled. This baseline
-allows the inertia model, frame transformations, reference generation, and
-moment conversion to be checked separately. The next step is to define the
-uncertainty model and evaluate its adaptive compensation across the intended
-flight conditions, including actuator limits and transitions.
+## Shared rotational-control architecture
 
-## Initial integration scope
+The preferred architecture uses one geometric rotational controller throughout
+hover, transition, and cruise. Phase-specific reference generators determine
+the desired orientation and collective thrust, while the shared controller
+determines the moments needed to track orientation and angular motion. Figure 2
+shows the proposed separation of these functions.
 
-The proposed implementation uses separate cruise-controller modules selected
-by a new airframe preset. The stock quad-tailsitter configuration remains
-available as a comparison baseline. Table 2 separates the functional changes
-from the configuration needed to select them.
+```text
+Hover motion control ----------\
+Transition trajectory ----------+--> Reference selection and shaping
+Skid-to-turn velocity control -/            |                  |
+                                  Attitude and angular     Collective
+                                     motion reference        thrust
+                                           |                  |
+                                  Geometric rotational        |
+                                       controller             |
+                                           |                  |
+                                     Moment command           |
+                                           |                  |
+                                           +--------+---------+
+                                                    |
+                                            Actuator interface
+                                                    |
+                                          PX4 control allocation
+                                                    |
+                                                Four motors
+```
 
-*Table 2. Proposed changes for the skid-to-turn cruise-control path.*
+*Figure 2. Proposed reference generation, shared rotational control, and motor-command path.*
 
-| Area | Existing PX4 component | Proposed change |
-| --- | --- | --- |
-| Motion control | `fw_lat_lon_control` | Replace the mapping from desired motion to attitude and thrust with skid-to-turn velocity control. Review pitch and throttle control for compatibility. |
-| Rotational control | `fw_att_control` and `fw_rate_control` | Replace their combined cruise control law with the geometric controller and its moment-to-torque interface. |
-| Controller selection | Airframe preset and VTOL startup | Add a separate preset and select the replacement modules without competing publishers. |
+The VTOL supervisor selects the reference source, manages transition requests
+and completion, and applies phase-dependent limits. Collective thrust passes
+from reference generation to the actuator interface, while the rotational
+controller computes the moment command. A single controller instance removes
+the need to switch between separate hover and cruise rotational control laws,
+but reference changes still require continuity and validity checks.
 
-The existing [longitudinal control path][fw-longitudinal-control] obtains pitch
-and throttle targets from the total energy control system (TECS), unless direct
-overrides are supplied. Its reuse requires review because the proposed
-velocity controller must select attitude and thrust together using the
-vehicle's force model. Retaining the existing pitch/throttle logic has not yet
-been established as compatible with skid-to-turn control.
+### Reference generation and body frames
 
-Airframe selection requires startup and build integration in addition to the
-controller equations. The initial implementation sequence is:
+The shared controller needs a coherent reference trajectory. Table 2 specifies
+the proposed interface, whose fields must describe the same reference time.
 
-1. Add a preset with a new autostart ID, using `4018_gz_quadtailsitter` as a
-   starting point, and register it in the
-   [simulation airframe build list][sim-airframe-list]. Explicitly select the
-   existing Gazebo model and initially retain its motor and transition
-   configuration for comparison.
-2. Add the new controller modules to the build and introduce a controller
-   selector scoped to this airframe. The selector and module names remain to
-   be defined.
-3. Update the [VTOL startup script][vtol-startup] to start the selected cruise
-   path. It currently starts `fw_lat_lon_control`, `fw_att_control`, and
-   `fw_rate_control` for VTOL vehicles. Starting replacement modules from the
-   preset alone would leave those stock modules running. The selection must
-   also account for fixed-wing autotuning, which the same script starts.
-4. Define ownership of attitude, torque, and thrust setpoints through hover,
-   transition, and cruise, including controller-state initialization at
-   handover. The replacement rotational controller must provide the virtual
-   fixed-wing torque and thrust topics consumed by the existing VTOL routing.
+*Table 2. Proposed reference interface for the shared rotational-control path.*
 
-The development starts from the existing hover controllers, tailsitter
-transition logic, and motor allocator. Their reuse will be evaluated with the
-vehicle model. The initial scope also retains `fw_mode_manager`, with review
-of its guidance assumptions and how mode-specific requests map to the new
-velocity objective. A new top-level vehicle classification is not required
-for this initial controller-selection approach.
+| Quantity | Convention and purpose |
+| --- | --- |
+| Desired orientation | Quaternion mapping the desired physical body frame into the local NED frame. |
+| Desired angular velocity | Components in the desired body frame, in rad/s. |
+| Desired angular acceleration | Derivative of those desired angular-velocity components, in rad/s². |
+| Collective propulsive thrust | Physical thrust demand in N along the modeled collective-thrust axis. |
+| Timing and validity | Reference time and conditions under which the reference remains usable. |
 
-The implementation must preserve the frame transformations between the hover
-body frame and PX4's virtual fixed-wing frame. The existing
-[tailsitter attitude-frame conversion][tailsitter-frame] documents that
-relationship. Each setpoint topic must also have a defined publisher in each
-flight phase so the stock and replacement controllers do not issue competing
-commands.
+PX4's existing [`VehicleAttitudeSetpoint` message][attitude-setpoint] provides
+an attitude quaternion, yaw-rate command, and normalized thrust. A new
+reference message or equivalent internal interface is needed to carry the
+full trajectory. Adapters can accept existing setpoints while preserving
+their published interfaces. Reusing a hover controller also requires a
+calibrated conversion from its normalized thrust command to the physical
+thrust used by the proposed interface.
 
-The geometric candidate would provide combined rotational control in cruise.
-If a cascaded alternative is evaluated, reuse of the fixed-wing rate controller
-requires a separate review of gains, torque scaling, and saturation feedback.
-For example,
-[`FW_ARSP_SCALE_EN`][rate-scaling] accounts for changes in aerodynamic
-control-surface effectiveness with airspeed. Motor-generated torque requires
-scaling appropriate to its own response. Navigation modes such as Mission,
-Hold, and Return will also need evaluation with the new cruise controller and
-its maneuver limits.
+Reference shaping must generate angular motion consistently with the desired
+orientation. Transition control, for example, must provide a smooth rotation
+into cruise with corresponding angular velocity and acceleration. The
+rotational controller uses gyro measurements at its inner-loop rate while
+reference generation may run more slowly, so the interface must define how
+the reference is evaluated between updates.
+
+The control core will use one physical body frame, corresponding to PX4's
+hover body frame, throughout flight. The aircraft's rotation into cruise
+changes its orientation relative to the world, while its body axes and
+inertia matrix remain attached to the aircraft. Aerodynamic calculations can
+use a cruise body frame, but their results and references must be converted
+at the interface. The existing [tailsitter frame conversion][tailsitter-frame]
+defines the relationship to PX4's virtual fixed-wing frame.
+
+### Rotational control and controller state
+
+The same rigid-body moment law can track the reference in each flight phase.
+Changing aerodynamic loading requires an appropriate model, compensation,
+and control authority across the operating range. Shared implementation
+allows scheduled gains or compensation, but those choices and the adaptive
+model must be checked against the controller's analysis.
+
+Controller state needs an explicit continuity policy when the reference
+source changes. A flight-phase change alone does not justify resetting every
+adaptive estimate. Saturation, disarming, invalid references, and changes in
+model validity need defined behavior so the controller does not interpret
+unachievable commands as evidence of an unknown aerodynamic moment.
+
+PX4's existing multicopter attitude controller is another possible baseline.
+Its [quaternion control law][mc-attitude-law] retains yaw control while
+prioritizing thrust-direction alignment over rotation about the thrust axis.
+Those priorities require review for cruise, and its module currently
+[runs attitude control during hover or tailsitter transition][mc-attitude-execution].
+Reusing that implementation would be a different design from the paper's
+combined moment-output law.
+
+### Actuator interface and VTOL supervision
+
+The actuator interface converts physical moments and thrust into PX4's
+[normalized torque][torque-setpoint] and [thrust setpoints][thrust-setpoint]
+in the physical body frame. The proposed path publishes one command stream
+to the motor allocation input throughout hover, transition, and cruise.
+The allocator's normalization,
+[phase-dependent motor behavior][tailsitter-motor-masks], and achievable
+combinations of thrust and moment require verification with the vehicle model.
+A shared rotational controller does not establish that every velocity request
+can be achieved while holding the selected roll attitude.
+
+The current `vtol_att_control` module combines supervision with reference
+selection and actuator routing. Its
+[callbacks and execution conditions][vtol-scheduling] depend on virtual
+multicopter or fixed-wing torque publications, and it
+[publishes the selected attitude and final actuator setpoints][vtol-output-routing].
+For this airframe, supervision and reference updates must run independently
+of the removed controllers' torque publications. The existing actuator-output
+path must also be disabled for this selection so it does not compete with the
+new actuator interface.
+
+The existing [cruise handover logic][vtol-tecs-handover] waits for the total
+energy control system (TECS) and a subsequent fixed-wing attitude reference
+when altitude control is enabled. The new path needs a readiness check for
+its own cruise reference generator, with defined thrust continuity. The
+existing [longitudinal controller][fw-longitudinal-control] also derives pitch
+and throttle from TECS unless direct overrides are supplied. Its compatibility
+with the proposed force-based selection of attitude and thrust has yet to be
+established.
+
+## PX4 integration scope
+
+The new airframe will select the shared controller path, while the stock
+quad-tailsitter configuration remains available as a comparison baseline.
+Table 3 lists the intended component changes. The target architecture
+replaces rotational control across all flight phases, while implementation
+can proceed in stages.
+
+*Table 3. Proposed PX4 component changes for shared rotational control.*
+
+| Existing component | Proposed treatment |
+| --- | --- |
+| `mc_pos_control` | Initially reuse hover motion control through a reference adapter. |
+| `fw_lat_lon_control` | Replace its behavior for this airframe with skid-to-turn velocity control. |
+| `mc_att_control` and `mc_rate_control` | Replace their rotational control functions as shared control is enabled in hover and transition. |
+| `fw_att_control` and `fw_rate_control` | Replace their cruise rotational control functions. |
+| `vtol_att_control` | Retain supervision and transition-state handling, with changed reference handling, scheduling, readiness checks, and actuator-output routing. |
+| `control_allocator` | Reuse motor allocation, with explicit verification of normalization, motor limits, and phase-dependent behavior. |
+
+The initial scope retains flight-mode handling, including `fw_mode_manager`,
+with review of how mode-specific guidance maps to the velocity objective and
+its maneuver limits. Mission, Hold, and Return require evaluation with that
+mapping. A new top-level vehicle classification is not required for this
+controller-selection approach.
+
+The [multicopter attitude module][mc-manual-reference] and
+[fixed-wing attitude module][fw-manual-reference] also generate attitude
+references from manual input. Disabling those modules therefore requires
+moving the relevant manual setpoint generation upstream. Acro and Offboard
+body-rate or torque commands need explicit paths that preserve their command
+semantics, with one owner of each output. They cannot all be treated as
+attitude-reference inputs to the geometric law.
+
+### Implementation and evaluation
+
+The implementation starts with controller interfaces and proceeds through
+flight-phase evaluation before enabling adaptive compensation:
+
+1. Add a preset with a new autostart ID, based on `4018_gz_quadtailsitter`,
+   and register it in the [simulation airframe build list][sim-airframe-list].
+   Select the existing Gazebo model for comparison. Add the new modules to
+   the build and define their reference interface and controller selector.
+   Module and parameter names remain to be defined.
+2. Update the [VTOL startup script][vtol-startup] to select the new path.
+   Establish independent VTOL supervision and define setpoint ownership for
+   every enabled phase and control mode before disabling the corresponding
+   stock modules. The selection must also account for autotuning modules,
+   which the script currently starts.
+3. With adaptive compensation disabled, verify the inertia model, frame and
+   unit conversions, moment scaling, allocation feedback, and hover tracking.
+   Use the existing hover motion-control behavior as the initial reference
+   source.
+4. Add smooth transition references and the new cruise readiness checks, then
+   evaluate transitions and skid-to-turn cruise control. Check source changes,
+   stale references, disarming, actuator saturation, and manual and Offboard
+   command paths.
+5. Establish the uncertainty model and evaluate adaptive compensation across
+   the intended flight conditions. Review the analysis for any scheduling,
+   saturation handling, or reference-generation changes made during
+   implementation.
 
 ## References
 
@@ -462,7 +587,6 @@ control paper supplies the candidate rotational law and its modeling assumptions
 [fw-attitude-publication]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/fw_lateral_longitudinal_control/FwLateralLongitudinalControl.cpp#L76-L80
 [fw-acceleration-to-roll]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/fw_lateral_longitudinal_control/FwLateralLongitudinalControl.cpp#L884-L886
 [tailsitter-frame]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/fw_att_control/FixedwingAttitudeControl.hpp#L114-L117
-[rate-scaling]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/fw_rate_control/fw_rate_control_params.yaml#L208-L221
 [geometric-paper]: https://doi.org/10.1115/1.4030419
 [geometric-preprint]: https://arxiv.org/abs/1411.2986
 [torque-setpoint]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/msg/VehicleTorqueSetpoint.msg
@@ -472,3 +596,13 @@ control paper supplies the candidate rotational law and its modeling assumptions
 [fw-longitudinal-control]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/fw_lateral_longitudinal_control/FwLateralLongitudinalControl.cpp#L214-L246
 [sim-airframe-list]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/ROMFS/px4fmu_common/init.d-posix/airframes/CMakeLists.txt#L87
 [vtol-startup]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/ROMFS/px4fmu_common/init.d/rc.vtol_apps#L11-L41
+[attitude-setpoint]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/msg/versioned/VehicleAttitudeSetpoint.msg
+[mc-attitude-law]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/mc_att_control/AttitudeControl/AttitudeControl.cpp#L148-L190
+[mc-attitude-execution]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/mc_att_control/mc_att_control_main.cpp#L303-L308
+[vtol-scheduling]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/vtol_att_control/vtol_att_control_main.cpp#L264-L365
+[vtol-output-routing]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/vtol_att_control/vtol_att_control_main.cpp#L410-L469
+[vtol-tecs-handover]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/vtol_att_control/vtol_type.cpp#L111-L153
+[mc-manual-reference]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/mc_att_control/mc_att_control_main.cpp#L310-L317
+[fw-manual-reference]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/fw_att_control/FixedwingAttitudeControl.cpp#L91-L119
+[thrust-setpoint]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/msg/VehicleThrustSetpoint.msg
+[tailsitter-motor-masks]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/control_allocator/VehicleActuatorEffectiveness/ActuatorEffectivenessTailsitterVTOL.cpp#L104-L128

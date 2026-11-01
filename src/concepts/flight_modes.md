@@ -196,6 +196,10 @@ flight configuration without necessarily changing `nav_state`. The
 transition state. Changes to transition behavior therefore require considering
 both the flight configuration and the active mode.
 
+The [VTOL flight and transitions](vtol_flight_and_transitions.md) chapter
+traces the subsystem handoffs, tailsitter transition conditions, and their
+implications for a shared rotational controller.
+
 ## Mode requirements and failsafe behavior
 
 Modes depend on valid estimates and inputs. Altitude needs a local altitude
