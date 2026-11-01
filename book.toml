@@ -1,0 +1,15 @@
+[book]
+title = "PX4 Autopilot Notes"
+description = "Personal documentation and notes on the PX4 autopilot."
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
+
+[output.html]
+additional-css = ["theme/pagetoc.css"]
+additional-js = ["theme/pagetoc.js"]
+site-url = "/px4-docs/"
+git-repository-url = "https://github.com/trevorashley/px4-docs"
+edit-url-template = "https://github.com/trevorashley/px4-docs/edit/main/{path}"
