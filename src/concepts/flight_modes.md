@@ -231,6 +231,151 @@ state. A failsafe can also activate the same Return or Land behavior that an
 operator can request, so the active mode alone does not identify what caused the
 change.
 
+## How modes are switched
+
+Commander handles a mode switch in two stages. It first accepts or rejects a
+request to change the intended mode, then resolves that intention against
+failsafe policy to select the active mode. Other modules react to the state that
+Commander publishes. This separation explains how a request can be accepted
+while `nav_state` still differs from `nav_state_user_intention`.
+
+### Who can request a change
+
+The word "user" in `nav_state_user_intention` includes software that requests an
+operating mode. Table 5 lists the main request paths. The field records a mode
+value, and the identity of the person or process that requested it is not stored
+there.
+
+*Table 5. Sources of mode requests and their paths into Commander.*
+
+| Requester | Path into Commander | Example |
+| --- | --- | --- |
+| Pilot using radio control (RC) switches | Manual control publishes an `action_request`, which Commander handles in `executeActionRequest()`. | Select the mode assigned to a flight-mode slot. |
+| Ground station or companion program | A `vehicle_command` reaches `handle_command()`, which translates the command into a navigation-state identifier. | Request Hold, Return, or Offboard. |
+| Onboard completion logic | Commander calls `UserModeIntention::change()` when processing a completed task. | Switch to Hold after a standalone takeoff finishes. |
+| Registered mode executor | A command on `vehicle_command_mode_executor` is checked for ownership before being forwarded to `vehicle_command`. | A component sequences flight modes as part of an operation. |
+
+See the [RC mode-slot requests][rc-mode-slots],
+[RC action handler][commander-rc-actions],
+[vehicle-command handler][commander-mode-commands],
+[completion handling][commander-completion], and
+[executor command forwarding][executor-commands]. For MAVLink `SET_MODE`, the
+[MAVLink receiver][mavlink-set-mode] constructs the `vehicle_command` that
+Commander consumes.
+
+The [`ModeChangeSource` enum][mode-change-source] groups RC and ordinary vehicle
+commands under `User`. `ModeExecutor` identifies executor-originated requests
+and is also used by some onboard completion transitions. These categories help
+manage executor ownership, and they do not distinguish a human ground-station
+operator from an ordinary companion program.
+
+Pilot stick movement provides another request path. For a multicopter or a VTOL
+in multicopter flight, configured stick override can request Position while an
+automatic or Offboard mode is active. If a failsafe is already active, Commander
+passes the takeover request to the failsafe state machine. See
+[`manualControlCheck()`][commander-stick-override].
+
+### How competing requests are resolved
+
+Ordinary requests share one stored intention. Each accepted call to
+[`UserModeIntention::change()`][mode-intention] replaces it, so processing order
+matters. That method applies the same acceptance check to RC and ordinary
+vehicle-command requests. In this revision, the
+[Commander loop][commander-request-order] handles a `vehicle_command` before an
+`action_request`. If both request a mode change in the same pass and both are
+accepted, the later action request replaces the command's intention. This is a
+consequence of the loop order, and later requests can replace it again.
+
+Acceptance depends on the requested mode's requirements, as described in
+[mode requirements and failsafe behavior](#mode-requirements-and-failsafe-behavior).
+While armed, `change()` normally checks `canRun()`. Selected callers can allow a
+fallback or use `force` to skip that check, but the failsafe stage still resolves
+the active mode. For example, the mode-command handler forces a Land request so
+that a fallback can be selected if Land cannot run. Once Termination is active,
+`change()` refuses requests to leave it, even when `force` is set.
+
+Registered mode executors have an additional ownership check. Commander forwards
+commands from their dedicated topic only when the sending executor is currently
+in charge. A `User` request for a built-in mode without an executor owner returns
+ownership to PX4's default autopilot executor. See
+[executor command forwarding][executor-commands] and
+[`onUserIntendedNavStateChange()`][executor-ownership].
+
+Failsafe arbitration then determines whether the intended mode can become
+active. When multiple failsafe actions are active, the framework selects the
+highest-priority action in its [`Action` ordering][failsafe-actions]. It also
+applies delays, clearing conditions, and takeover restrictions before selecting
+an executable response. A new mode request can signal pilot takeover, but that
+takeover must be permitted by the active failsafe policy. See
+[`FailsafeBase::getSelectedAction()`][failsafe-selection].
+
+RC mode selection usually responds to a switch change. After initialization,
+leaving the mode-slot switch in one position does not repeatedly request that
+mode on every RC update. A ground-station request can therefore remain active
+while the RC switch stays in its previous position. See
+[`ManualControl::processSwitches()`][rc-mode-switches].
+
+### What happens after a request is accepted
+
+The switch proceeds through shared state and module-specific behavior:
+
+1. `UserModeIntention::change()` stores the intended mode, sets
+   `_had_mode_change`, and notifies the mode-management handler so executor
+   ownership can be updated. It also remembers a suitable mode to restore after
+   disarming.
+2. [`handleModeIntentionAndFailsafe()`][commander-state] evaluates failsafes and
+   sets `nav_state_user_intention` and `nav_state`. With no overriding failsafe
+   action, the active mode follows the intention. When `nav_state` changes,
+   Commander updates `nav_state_timestamp`.
+3. Commander derives `VehicleControlMode` from the active mode and publishes it
+   with `VehicleStatus`. The [publication path][commander-state-publication]
+   supplies the state that other modules consume.
+4. Those modules update their behavior. Navigator selects an automatic behavior
+   and runs its activation or inactivation hooks. The multicopter flight mode
+   manager selects a flight task, and fixed-wing mode management selects its
+   control behavior.
+
+The consumers have their own transition logic. In Navigator,
+[`NavigatorMode::run()`][navigator-lifecycle] calls `on_activation()` when a
+behavior becomes active and `on_inactivation()` when it stops. For a new
+multicopter flight task, [`switchTask()`][flight-task-switching] saves the previous
+trajectory setpoint and passes it to the new task's `activate()` method. If the
+selected task is already running, it returns without reactivating it. Several
+automatic modes share the `Auto` task, so a navigation-state change can update
+Navigator's behavior while that flight task continues running.
+
+Command acceptance and active-mode selection occur at different points in the
+Commander loop. In this revision, command and RC action handling occur after
+`handleModeIntentionAndFailsafe()`, so an accepted request normally reaches that
+resolver on the next pass. The command acknowledgment reports whether the
+request was accepted. To determine what is running, inspect the subsequently
+published `nav_state` and failsafe state.
+
+An accepted request for the current intention still sets `_had_mode_change`.
+This lets a repeated request signal takeover during a failsafe. It does not by
+itself change `nav_state_timestamp`, which updates only when the active mode
+changes.
+
+### Example: a ground station requests Hold
+
+Suppose a multicopter is flying in Position, its estimates are valid, and no
+failsafe is active. The RC mode-slot switch remains in Position, and the pilot
+keeps the sticks centered. A ground station sends an accepted request for Hold.
+Commander stores `NAVIGATION_STATE_AUTO_LOITER` as the intention, then selects
+it as the active mode on the next resolution pass.
+
+The published controller flags enable automatic control. Navigator activates
+its loiter behavior, whose [`on_activation()`][loiter-activation] initializes the
+hold target. The multicopter flight mode manager switches from its manual task
+to `Auto`, which generates motion setpoints from the navigation target. Position
+control remains enabled throughout this change.
+
+The unchanged RC switch does not immediately undo the ground-station request.
+If the pilot moves it to an Altitude slot, manual control publishes a new action
+request. If accepted, that request replaces the intention with
+`NAVIGATION_STATE_ALTCTL`, and the same resolution and publication process runs
+again.
+
 ## Basic Offboard behavior
 
 Offboard uses setpoints supplied by an external system through supported MAVLink
@@ -278,7 +423,7 @@ when either mode can run, examine the mode requirements and health checks.
 [vehicle-control-mode]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/msg/VehicleControlMode.msg
 [control-mode]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/commander/ModeUtil/control_mode.cpp#L46-L163
 [setpoint-types]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/commander/ModeUtil/setpoint_types.cpp#L46-L166
-[commander-state]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/commander/Commander.cpp#L2547-L2599
+[commander-state]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/commander/Commander.cpp#L2547-L2622
 [commander-control]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/commander/Commander.cpp#L2809-L2828
 [navigator]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/navigator/navigator_main.cpp#L1005-L1083
 [flight-tasks]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/flight_mode_manager/FlightModeManager.cpp#L140-L283
@@ -299,3 +444,20 @@ when either mode can run, examine the mode requirements and health checks.
 [failsafe]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/commander/failsafe/failsafe.cpp#L770-L825
 [offboard-check]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/commander/HealthAndArmingChecks/checks/offboardCheck.cpp#L38-L117
 [offboard-docs]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/docs/en/flight_modes/offboard.md
+[mode-change-source]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/commander/UserModeIntention.hpp#L39-L67
+[rc-mode-slots]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/manual_control/ManualControl.cpp#L457-L512
+[rc-mode-switches]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/manual_control/ManualControl.cpp#L197-L339
+[commander-rc-actions]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/commander/Commander.cpp#L1872-L1954
+[commander-mode-commands]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/commander/Commander.cpp#L933-L1101
+[commander-completion]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/commander/Commander.cpp#L2252-L2279
+[executor-commands]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/commander/Commander.cpp#L1783-L1818
+[mavlink-set-mode]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/mavlink/mavlink_receiver.cpp#L1120-L1147
+[commander-stick-override]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/commander/Commander.cpp#L3164-L3200
+[commander-request-order]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/commander/Commander.cpp#L2070-L2150
+[executor-ownership]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/commander/ModeManagement.cpp#L465-L485
+[failsafe-actions]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/commander/failsafe/framework.h#L52-L76
+[failsafe-selection]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/commander/failsafe/framework.cpp#L444-L622
+[commander-state-publication]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/commander/Commander.cpp#L2166-L2184
+[navigator-lifecycle]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/navigator/navigator_mode.cpp#L56-L85
+[flight-task-switching]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/flight_mode_manager/FlightModeManager.cpp#L382-L417
+[loiter-activation]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/navigator/loiter.cpp#L54-L75
