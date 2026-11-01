@@ -1,15 +1,12 @@
 # PX4 Autopilot Notes
 
-Welcome to my personal documentation of the PX4 autopilot.
+These notes explore PX4 from the perspective of a software developer adding
+features to the autopilot. They connect concepts and vehicle behavior to the
+source code that implements them.
 
-This is the initial test page for the book. Future chapters will contain my
-notes, explanations, and examples as I explore PX4.
+Start with [flight modes](concepts/flight_modes.md) to understand how PX4
+interprets commands, selects control behavior, and handles differences between
+multicopter, fixed-wing, and VTOL vehicles.
 
-## Test page
-
-If you can read this page, the book has built successfully. Try the search box
-and theme selector in the toolbar to explore the book's built-in features.
-
-```text
-PX4 documentation starts here.
-```
+The notes target the development branch, `main`. Each chapter records the
+revision it was checked against and links to that revision of the source.
