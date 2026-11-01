@@ -95,7 +95,7 @@ inclination of the airflow in the cruise body frame, from sideslip, which
 describes its lateral inclination. Their relationship to force and moment
 depends on the airframe and operating condition. Pitch and yaw responses must
 be modeled separately before assuming they are symmetric or decoupled. The
-[aerodynamic references](#aerodynamic-references) provide the background for
+[aerodynamic references](#references) provide the background for
 these relationships.
 
 ## Controlling the velocity vector
@@ -134,10 +134,15 @@ The proposed control sequence is:
 2. Use the force model to select an attitude and collective thrust that produce
    that acceleration while regulating the chosen roll attitude. Include gravity
    when determining the force needed to maintain or change altitude.
-3. Use the new attitude controller to track the complete attitude target,
-   including yaw, and generate angular-rate targets.
-4. Track the angular-rate targets and allocate the required thrust and moments
-   to the four motors through the VTOL motor-control path.
+3. Use rotational control to track the complete attitude target, including yaw,
+   and its angular motion to determine the required control moment.
+4. Convert the control moment and collective thrust into allocation inputs and
+   distribute them to the four motors through the VTOL motor-control path.
+
+Rotational control can use separate attitude and rate loops or a combined law.
+The [geometric adaptive candidate](#candidate-geometric-adaptive-controller)
+below combines attitude and angular-rate feedback and outputs a control moment
+directly.
 
 Yaw attitude is an intermediate control target in this sequence. The velocity
 response determines whether the requested maneuver is achieved. In particular,
@@ -173,8 +178,8 @@ must retain yaw error and control orientation about all three axes.
 
 The [current attitude-controller implementation][fw-turn-coordination] adds
 pitch- and yaw-rate feedforward commands based on attitude and airspeed to
-coordinate a banked turn. The proposed controller will generate its rate targets
-from the skid-to-turn attitude objective and vehicle dynamics.
+coordinate a banked turn. The replacement will use reference angular motion
+derived from the skid-to-turn attitude objective and vehicle dynamics.
 
 Changing the coordinated-turn feedforward alone would leave the yaw-error
 removal in place. The replacement must address both parts of the current
@@ -194,6 +199,104 @@ attitude controller must therefore be accompanied by changes to the upstream
 lateral control path. An unchanged bank-angle command would continue asking
 the new attitude controller to execute the previous maneuver strategy.
 
+## Candidate geometric adaptive controller
+
+The attitude-tracking controller in Goodarzi, Lee, and Lee's
+[*Geometric Adaptive Tracking Control of a Quadrotor Unmanned Aerial Vehicle
+on SE(3) for Agile Maneuvers*][geometric-paper] is a candidate for the new
+rotational controller. The relevant design is in Section 3, particularly
+equations 9–16. It has yet to be implemented or evaluated for this vehicle.
+
+The paper develops tracking control on SE(3), which describes position and
+orientation together. Its rotational controller operates on SO(3), the space of
+three-dimensional rotations. It uses the complete orientation error, including
+yaw, and angular-velocity error. These properties fit the need to track the
+attitude required for skid-to-turn flight. The authors state that the attitude
+results also apply to rigid-body attitude dynamics beyond quadrotors.
+
+PX4 already uses quaternion-based attitude calculations in the
+[fixed-wing attitude controller][fw-attitude-error]. The useful changes for this
+design are full three-axis attitude tracking and an explicit moment-control law
+with adaptive compensation. The candidate's stability results depend on its
+model, gain, and reference assumptions, which must be checked for this vehicle
+and any implementation changes.
+
+### Combined attitude and rate control
+
+Equation 15 generates a control moment, using attitude error and angular-rate
+error together with reference-motion terms. Its reference inputs include
+desired attitude, angular velocity, and angular acceleration. The outer
+controller must therefore generate a smooth attitude reference with consistent
+derivatives. Abrupt attitude targets alone do not supply the reference motion
+used by the law.
+
+Adopting this law would replace the combined cruise attitude-and-rate control
+law. Passing its moment output through an unchanged PX4 rate controller would
+introduce another feedback loop and produce a different controller. The
+implementation must assign ownership of the rotational command at the point
+where the existing rate controller produces torque setpoints.
+
+### Adaptive compensation assumptions
+
+Section 2 models the uncertain moment in a specific form:
+
+```text
+uncertain_moment = W_R(x, v, R, Omega) * theta_R
+```
+
+Here `x`, `v`, `R`, and `Omega` denote position, velocity, orientation, and body
+angular velocity. `W_R` is a known matrix-valued function of the state, and
+`theta_R` contains fixed unknown parameters with assumed known bounds. Equation
+16 updates the parameter estimates using attitude and angular-rate errors.
+
+Selected uncertain aerodynamic coefficients could fit this structure if their
+state dependence is represented appropriately in `W_R`. The vehicle model must
+establish that relationship, including the estimates needed to evaluate it.
+Adaptive compensation does not remove the need to model the wing, body, and
+propulsion system. The attitude result establishes tracking-error convergence
+and bounded parameter-estimation error under its assumptions, without
+establishing convergence to the true parameter values.
+
+### Velocity-vector control remains vehicle specific
+
+Section 4 develops a position-tracking controller for the paper's quadrotor
+model. Equations 20–25 construct a desired attitude by selecting a thrust-axis
+direction from position and velocity errors, reference acceleration, and
+parameterized force compensation.
+
+The tailsitter's outer loop must determine attitude and thrust for wingborne
+skid-to-turn flight while regulating the chosen roll attitude. That requires a
+force balance accounting for aerodynamic lift, sideslip, and wind. The desired
+attitude must be compatible with the velocity objective and available thrust
+and torque. The paper's rotational controller can track that reference, but the
+outer velocity controller still requires development and analysis. Changing
+the position-tracking objective or removing position feedback would also
+change the assumptions of the paper's translational stability analysis.
+
+### PX4 integration and evaluation
+
+The paper's moment command has physical units, such as N m when the model uses
+SI units. PX4's [`VehicleTorqueSetpoint.xyz`][torque-setpoint] is normalized.
+Integration therefore requires an explicit conversion consistent with the
+actuator model, allocator normalization, and tailsitter frame transformations.
+The [tailsitter allocation configuration][tailsitter-normalization] enables
+roll, pitch, and yaw normalization for the motor allocation matrix.
+
+In VTOL operation, the [existing fixed-wing rate controller][fw-rate-outputs]
+publishes `vehicle_torque_setpoint_virtual_fw` and
+`vehicle_thrust_setpoint_virtual_fw`. A replacement must integrate with the
+phase-dependent VTOL routing and its differential-thrust scaling, with a defined
+publisher for each command. The controller must also account for motor limits
+and specify how adaptation behaves during saturation, disarming, and handover.
+Those implementation choices require evaluation beyond the paper's control law.
+
+The proposed evaluation starts with the geometric controller's feedback and
+reference-motion terms while adaptive compensation is disabled. This baseline
+allows the inertia model, frame transformations, reference generation, and
+moment conversion to be checked separately. The next step is to define the
+uncertainty model and evaluate its adaptive compensation across the intended
+flight conditions, including actuator limits and transitions.
+
 ## Initial integration scope
 
 The development starts from the existing hover controllers, tailsitter
@@ -208,20 +311,23 @@ relationship. Each setpoint topic must also have a defined publisher in each
 flight phase so the stock and replacement controllers do not issue competing
 commands.
 
-Reuse of the fixed-wing rate controller requires a separate review of gains,
-torque scaling, and saturation feedback. For example,
+The geometric candidate would provide combined rotational control in cruise.
+If a cascaded alternative is evaluated, reuse of the fixed-wing rate controller
+requires a separate review of gains, torque scaling, and saturation feedback.
+For example,
 [`FW_ARSP_SCALE_EN`][rate-scaling] accounts for changes in aerodynamic
 control-surface effectiveness with airspeed. Motor-generated torque requires
 scaling appropriate to its own response. Navigation modes such as Mission,
 Hold, and Return will also need evaluation with the new cruise controller and
 its maneuver limits.
 
-## Aerodynamic references
+## References
 
 The following references support the distinction between attitude and velocity,
 the use of angle of attack and sideslip in force models, and the treatment of
 coupled flight dynamics. The vehicle's coefficients, motor response, and control
-limits remain to be established for its operating conditions.
+limits remain to be established for its operating conditions. The geometric
+control paper supplies the candidate rotational law and its modeling assumptions.
 
 1. George M. Siouris, *Missile Guidance and Control Systems*, Springer, 2004.
    Section 3.1, especially pp. 56 and 60–61, describes aerodynamic forces and
@@ -232,6 +338,15 @@ limits remain to be established for its operating conditions.
    and introduces lateral flight dynamics.
 3. Jack N. Nielsen, *Missile Aerodynamics*. Section 10-2, pp. 353–355, describes
    force-and-moment dependencies and stability derivatives.
+4. Farhad A. Goodarzi, Daewon Lee, and Taeyoung Lee,
+   [*Geometric Adaptive Tracking Control of a Quadrotor Unmanned Aerial Vehicle
+   on SE(3) for Agile Maneuvers*][geometric-paper], *Journal of Dynamic Systems,
+   Measurement, and Control*, 137(9), 091007, 2015.
+   Section 2 defines the uncertainty model. Section 3, especially equations
+   9–18, develops attitude tracking. Section 4, especially equations 20–25,
+   develops the position-tracking construction. These section and equation
+   references use the journal version. An [author preprint][geometric-preprint]
+   is also available.
 
 [revision]: https://github.com/PX4/PX4-Autopilot/commit/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332
 [quad-preset]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/ROMFS/px4fmu_common/init.d-posix/airframes/4018_gz_quadtailsitter
@@ -245,3 +360,8 @@ limits remain to be established for its operating conditions.
 [fw-acceleration-to-roll]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/fw_lateral_longitudinal_control/FwLateralLongitudinalControl.cpp#L884-L886
 [tailsitter-frame]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/fw_att_control/FixedwingAttitudeControl.hpp#L114-L117
 [rate-scaling]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/fw_rate_control/fw_rate_control_params.yaml#L208-L221
+[geometric-paper]: https://doi.org/10.1115/1.4030419
+[geometric-preprint]: https://arxiv.org/abs/1411.2986
+[torque-setpoint]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/msg/VehicleTorqueSetpoint.msg
+[tailsitter-normalization]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/control_allocator/VehicleActuatorEffectiveness/ActuatorEffectivenessTailsitterVTOL.hpp#L67-L71
+[fw-rate-outputs]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/fw_rate_control/FixedwingRateControl.cpp#L44-L51
