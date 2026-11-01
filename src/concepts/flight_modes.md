@@ -3,9 +3,9 @@
 A flight mode determines how PX4 interprets commands and controls vehicle motion.
 Each mode coordinates several parts of the software, and multiple modes can
 share controllers. To understand or extend a mode, trace where its commands come
-from, how PX4 acts on them, and which conditions allow it to run. Interpret the
-behavior for the vehicle type: holding a location means hovering for a
-multicopter and flying a loiter pattern for a fixed-wing aircraft.
+from, how PX4 acts on them, and which conditions allow it to run. Flight mode
+behavior depends on vehicle type, as a multicopter holds a location by hovering
+while a fixed-wing aircraft flies a loiter pattern.
 
 The examples cover built-in modes and basic Offboard control for
 multicopters, fixed-wing aircraft, and vertical takeoff and landing (VTOL)
@@ -56,11 +56,17 @@ system. Two messages connect the selected mode to its control behavior:
   kinds of control are enabled, such as attitude, altitude, position, manual
   input, and Offboard control.
 
-These flags show which kinds of control a mode enables. For example, Altitude
-enables attitude and vertical control, while Position also enables horizontal
-velocity and position control. Modes that enable the same controllers can
-generate different setpoints: multicopter Position interprets pilot input,
-whereas Hold generates an automatic hold target.
+The displayed mode names differ from some of the `VehicleStatus` identifiers.
+Altitude is `NAVIGATION_STATE_ALTCTL` (value `1`), Position is
+`NAVIGATION_STATE_POSCTL` (value `2`), and Hold is
+`NAVIGATION_STATE_AUTO_LOITER` (value `4`). The `nav_state` field stores the
+numeric value, and the [mode-name mapping][mode-names] defines its displayed name.
+
+The `VehicleControlMode` flags show which kinds of control a mode enables. For
+example, Altitude enables attitude and vertical control, while Position also
+enables horizontal velocity and position control. Modes that enable the same
+controllers can generate different setpoints. For multicopters, Position
+interprets pilot input, while Hold generates an automatic hold target.
 
 Arming is recorded separately in `VehicleStatus.arming_state`. A mode can be
 selected while disarmed; selection alone does not arm the vehicle or start a
