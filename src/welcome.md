@@ -1,12 +1,11 @@
-# PX4 Autopilot Notes
+# PX4 autopilot notes
 
-These notes explore PX4 from the perspective of a software developer adding
-features to the autopilot. They connect concepts and vehicle behavior to the
-source code that implements them.
+These notes explain PX4 for software developers adding features to the autopilot.
+They connect vehicle behavior to the source code that implements it.
 
 Start with [flight modes](concepts/flight_modes.md) to understand how PX4
-interprets commands, selects control behavior, and handles differences between
-multicopter, fixed-wing, and VTOL vehicles.
+interprets commands and controls multicopters, fixed-wing aircraft, and vertical
+takeoff and landing (VTOL) aircraft.
 
-The notes target the development branch, `main`. Each chapter records the
-revision it was checked against and links to that revision of the source.
+The notes follow PX4's development branch, `main`. Each chapter identifies the
+revision used to verify its explanations and links to that revision of the source.
