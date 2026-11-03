@@ -390,6 +390,80 @@ setpoints, PX4 retains attitude and rate control while the external system
 determines the desired attitude.
 See the [Offboard branch of the controller mapping][control-mode].
 
+### Message roles and active-mode reporting
+
+[`OffboardControlMode`][offboard-control-mode] declares the control level
+supplied by the external system and provides a timestamp used to check its
+availability. The message contains that timestamp and seven Boolean fields,
+but it carries no target position, velocity, attitude, or actuator values.
+Those values arrive through separate setpoint messages.
+
+Table 6 distinguishes the message from the status and controller-configuration
+messages that describe PX4's response.
+
+*Table 6. Roles of the three messages involved in built-in Offboard control.*
+
+| Message | Role |
+| --- | --- |
+| `OffboardControlMode` | Input describing the external controller's requested control level and recent activity. |
+| `VehicleStatus` | Commander output identifying the active flight mode through `nav_state` and the requested mode through `nav_state_user_intention`. |
+| `VehicleControlMode` | Commander output specifying which control functions are enabled, including Offboard context and the attitude, rate, motion-control, and allocation flags. |
+
+Publishing `OffboardControlMode` alone does not select the Offboard flight
+mode. A separate mode request must be accepted and become active. The
+Offboard control stream can therefore be available while the vehicle remains
+in Position or another mode.
+
+For the built-in Offboard mode, `nav_state == NAVIGATION_STATE_OFFBOARD` and
+`flag_control_offboard_enabled == true` represent the same active-mode fact
+at different interfaces. [`Commander::updateControlMode()`][commander-control]
+clears the control flags and rebuilds them from the active navigation state.
+The [Offboard branch][offboard-controller-mapping] sets the Offboard flag and
+uses `OffboardControlMode` to select the other flags. The Boolean Offboard flag
+is therefore derived state, while the rest of `VehicleControlMode` supplies
+the controller configuration that `nav_state` alone cannot express.
+
+The two output messages are separate uORB publications. Subscribers can
+temporarily hold samples from different updates, so compare timestamps when
+investigating an apparent disagreement. Also distinguish the active
+`nav_state` from `nav_state_user_intention`, which can continue recording an
+Offboard request while a failsafe selects another mode.
+
+### Selecting the control level
+
+The Boolean fields are evaluated in the priority order shown in Table 7.
+The first true field selects the controller mapping, so setting both
+`position` and `velocity` selects position control. Lower-priority fields
+do not independently enable additional control paths.
+
+*Table 7. Offboard control-level fields and the configuration derived by Commander, in priority order.*
+
+| Field | Requested input | Resulting control configuration |
+| --- | --- | --- |
+| `position` | Position target | Enables position, velocity, altitude, climb-rate, attitude, rate, and allocation flags. |
+| `velocity` | Velocity target | Enables the same flags as position input except the position flag. |
+| `acceleration` | Acceleration target | Enables velocity, attitude, rate, and allocation flags. Position, altitude, and climb-rate flags remain false. |
+| `attitude` | Attitude and thrust targets | Enables attitude, rate, and allocation flags. |
+| `body_rate` | Angular-rate and thrust targets | Enables rate and allocation flags. |
+| `thrust_and_torque` | Thrust and torque targets | Enables allocation without the upstream motion, attitude, or rate-control flags. |
+| `direct_actuator` | Motor and servo commands | Leaves those control-loop and allocation flags disabled. Actuator arming and output handling still apply. |
+
+The table describes the [Commander mapping][offboard-controller-mapping] and
+[setpoint-type configuration][setpoint-types]. There is no dedicated
+acceleration-control flag in `VehicleControlMode`, so the acceleration branch
+uses the velocity flag to route the request through the appropriate module.
+This flag choice does not turn an acceleration target into a velocity target.
+Interface and vehicle support still determine which setpoints can be used.
+
+An Offboard attitude request and an Offboard body-rate request thus have the
+same `nav_state` and Offboard flag, but different attitude-control flags.
+For the proposed shared rotational controller, the enabled control level
+must determine whether to track attitude, track rates, or leave moment
+generation to an external controller. The Offboard flag alone is insufficient
+to make that decision.
+
+### Availability and setpoint delivery
+
 PX4 requires a stream of recent Offboard control messages before arming in
 Offboard or entering the mode while armed. It also checks the estimates needed
 for the requested control level. If that stream is lost, `COM_OF_LOSS_T` sets the
@@ -398,11 +472,42 @@ handling.
 The [Offboard health check][offboard-check] and
 [Offboard documentation][offboard-docs] describe this behavior.
 
-MAVLink setpoint messages carry both the target and evidence that the external
-system is still sending messages. With ROS 2, `OffboardControlMode` selects the
-control level and acts as a keepalive: a periodic message indicating that the
-external system is still running. Separate topics carry setpoints, so a live
-keepalive alone does not establish that a setpoint publisher is still updating.
+The timestamp is in microseconds since system start in PX4's time base.
+The health check requires a recent timestamp and at least one control-level
+field set to true. It also checks relevant estimate validity, such as local
+position for position control and local velocity for velocity control.
+
+With ROS 2, the external application publishes `OffboardControlMode`
+periodically as a keepalive, indicating that it is still running. Separate
+topics carry the setpoints, so a live keepalive alone does not establish that
+a setpoint publisher is still updating. With MAVLink, supported incoming
+setpoint messages carry both the target and evidence of recent activity.
+PX4's receiver constructs and publishes the internal `OffboardControlMode`
+message from their contents. For example, the
+[local position-target handler][mavlink-offboard-control] derives the flags
+from populated trajectory fields and timestamps the resulting message.
+
+### Multicopter velocity-control example
+
+A ROS 2 application requesting velocity control can publish
+`OffboardControlMode` with `velocity=true` and the other control-level fields
+false, along with a matching `TrajectorySetpoint`. After Offboard becomes
+active, Commander reports `NAVIGATION_STATE_OFFBOARD`, sets the Offboard
+flag, and enables the velocity path and its inner controllers while leaving
+the position flag false.
+
+The trajectory contents must agree with that request. For multicopter
+velocity control, set the position fields to `NaN` and provide the desired
+velocity. Optional acceleration fields provide feedforward. Finite position
+fields can still contribute position feedback inside `mc_pos_control`, even
+when `OffboardControlMode` requests velocity control. The
+[position-control implementation][offboard-position-feedback] and
+[Offboard setpoint documentation][offboard-docs] explain this behavior.
+
+Changing the declared level to attitude control would select attitude and
+rate flags at the next control-configuration update without requiring a
+different navigation state. The publisher must also supply the corresponding
+attitude and thrust setpoints and manage continuity when changing interfaces.
 
 Supported setpoint types and coordinate frames depend on the interface and
 vehicle. Check support for the intended vehicle before adapting an Offboard
@@ -448,6 +553,10 @@ when either mode can run, examine the mode requirements and health checks.
 [failsafe]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/commander/failsafe/failsafe.cpp#L770-L825
 [offboard-check]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/commander/HealthAndArmingChecks/checks/offboardCheck.cpp#L38-L117
 [offboard-docs]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/docs/en/flight_modes/offboard.md
+[offboard-control-mode]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/msg/OffboardControlMode.msg
+[offboard-controller-mapping]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/commander/ModeUtil/control_mode.cpp#L112-L144
+[mavlink-offboard-control]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/mavlink/mavlink_receiver.cpp#L1223-L1345
+[offboard-position-feedback]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/mc_pos_control/PositionControl/PositionControl.cpp#L102-L153
 [mode-change-source]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/commander/UserModeIntention.hpp#L39-L67
 [rc-mode-slots]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/manual_control/ManualControl.cpp#L457-L512
 [rc-mode-switches]: https://github.com/PX4/PX4-Autopilot/blob/53b193a6fb1c7aec34fb7334a4ca91d4b9b20332/src/modules/manual_control/ManualControl.cpp#L197-L339
